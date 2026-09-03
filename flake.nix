@@ -15,30 +15,40 @@
         default =
         pkgs.stdenvNoCC.mkDerivation {
           pname = "blackmagic-utils";
-          version = "0.1.0";
+          version = "0.2.0";
           src = self;
-          nativeBuildInputs = [ pkgs.python312 ];
+          # bash for the generated shebang; python3 is the interpreter the
+          # dispatcher invokes for the inject/extract subcommands.
+          nativeBuildInputs = [ pkgs.bash pkgs.python3 ];
           installPhase = ''
-            mkdir -p $out/bin
-            for f in inject_gyro_into_braw.py extract_gyro_from_braw.py; do
-              cp $f $out/bin/$f
-              # Rewrite the shebang to the nix interpreter; '#!/usr/bin/env python3'
-              # cannot resolve inside the nix store.
-              sed -i "1s|^#!.*|#!${pkgs.python312}/bin/python3|" $out/bin/$f
-              chmod +x $out/bin/$f
-            done
-            ln -s $out/bin/inject_gyro_into_braw.py  $out/bin/braw-inject-gyro
-            ln -s $out/bin/extract_gyro_from_braw.py $out/bin/braw-extract-gyro
+            mkdir -p $out/bin $out/lib/bm_utils $out/share/bm_utils/scripts $out/share/bash-completion/completions
+
+            # Python logic (invoked explicitly, so no shebang fixup needed).
+            cp $src/inject_gyro_into_braw.py $src/extract_gyro_from_braw.py $out/lib/bm_utils/
+
+            # Fusion post-render scripts, so `bm_utils install` is self-contained.
+            cp -R $src/scripts/. $out/share/bm_utils/scripts/
+
+            # Bash completion (loaded automatically if the user has bash-completion).
+            cp $src/completions/bm_utils $out/share/bash-completion/completions/bm_utils
+
+            # The single dispatcher. Bake in an absolute interpreter (the nix
+            # bash for the shebang, the nix python for the BM_UTILS_PYTHON
+            # default) so it runs straight out of the store where no python3
+            # is on the PATH.
+            sed -e "1s|^#!.*|#!${pkgs.bash}/bin/bash|" -e "s|:-python3}|:-${pkgs.python3}/bin/python3}|" $src/bm_utils > $out/bin/bm_utils
+            chmod +x $out/bin/bm_utils
           '';
         };
       });
 
       devShells = forAllSystems (pkgs:
         pkgs.mkShell {
-          packages = [ pkgs.python312 ];
+          packages = [ pkgs.python3 pkgs.bash-completion ];
           shellHook = ''
-            braw-inject-gyro() { python3 ${self}/inject_gyro_into_braw.py "$@"; }
-            braw-extract-gyro() { python3 ${self}/extract_gyro_from_braw.py "$@"; }
+            # Make the repo's dispatcher + completion available in this shell.
+            export PATH="$PWD:$PATH"
+            . "$PWD/completions/bm_utils"
           '';
         });
     };

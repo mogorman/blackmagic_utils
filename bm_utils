@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# bm_utils -- single entry point for the Blackmagic RAW gyro / IMU tools.
+#
+#   bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
+#   bm_utils extract_gyro  INPUT.braw [options]               # .braw -> .gcsv
+#   bm_utils install                                               # install Fusion post-render scripts
+#
+# Each subcommand's full option list:  bm_utils <subcommand> --help
+#
+# The interpreter is taken from $BM_UTILS_PYTHON when set (the nix wrapper
+# sets it to its bundled python) and otherwise falls back to `python3` on the
+# PATH, so the same file works both as a nix-installed command and run straight
+# from the repo.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Locate our resources. The layout differs between a nix install and the
+# working tree, so probe for which one we're in.
+#   nix :  <root>/bin/bm_utils, <root>/lib/bm_utils, <root>/share/bm_utils/scripts
+#   repo :  bm_utils next to the python scripts and scripts/
+# ---------------------------------------------------------------------------
+base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$base/../lib/bm_utils" ]; then
+    root="$(cd "$base/.." && pwd)"
+    lib="$root/lib/bm_utils"
+    scripts_src="$root/share/bm_utils/scripts"
+else
+    root="$base"
+    lib="$base"
+    scripts_src="$base/scripts"
+fi
+
+py="${BM_UTILS_PYTHON:-python3}"
+
+# ---------------------------------------------------------------------------
+# install: copy every folder under $scripts_src into the Fusion user-scripts
+# dir. Files we ship overwrite their existing targets (clobber); any other
+# pre-existing files or subdirs in the target are left untouched (no rm, no
+# rsync --delete). Re-running merges in place rather than nesting.
+# ---------------------------------------------------------------------------
+install_fusion_scripts() {
+    local src="$1"
+    local target="${HOME}/.local/share/DaVinciResolve/Fusion/Scripts"
+
+    if [ ! -d "$src" ]; then
+        echo "error: no scripts to install (looked in: $src)" >&2
+        return 1
+    fi
+
+    shopt -s nullglob
+    local dirs=()
+    local e
+    for e in "$src"/*; do
+        if [ -d "$e" ]; then
+            dirs+=("$e")
+        fi
+    done
+
+    if [ "${#dirs[@]}" -eq 0 ]; then
+        echo "No script folders found in: $src" >&2
+        return 0
+    fi
+
+    mkdir -p "$target"
+    local d name
+    for d in "${dirs[@]}"; do
+        name="$(basename "$d")"
+        mkdir -p "${target}/${name}"
+        cp -R "${d}/." "${target}/${name}/"
+        echo "installed: ${name} -> ${target}/${name}"
+    done
+    echo "Done. ${#dirs[@]} folder(s) in ${target}"
+}
+
+usage() {
+    cat <<'EOF'
+bm_utils -- Blackmagic RAW gyro / IMU tools
+
+Usage:
+  bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
+  bm_utils extract_gyro  INPUT.braw [options]              # .braw -> .gcsv
+  bm_utils install                                                  # install Fusion post-render scripts
+  bm_utils -h | --help
+
+Run 'bm_utils <subcommand> --help' for a subcommand's options.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help|help)
+        usage
+        ;;
+    inject_gyro)
+        exec "$py" "$lib/inject_gyro_into_braw.py" "${@:2}"
+        ;;
+    extract_gyro)
+        exec "$py" "$lib/extract_gyro_from_braw.py" "${@:2}"
+        ;;
+    install)
+        install_fusion_scripts "$scripts_src"
+        ;;
+    *)
+        echo "error: unknown or missing subcommand: ${1:-<none>}" >&2
+        echo >&2
+        usage >&2
+        exit 2
+        ;;
+esac

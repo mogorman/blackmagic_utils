@@ -1,0 +1,25 @@
+# Bash completion for `bm_utils`.
+#
+# Picked up automatically when bash-completion is loaded (this file is
+# installed to share/bash-completion/completions/bm_utils by the flake).
+# Can also be sourced directly, e.g.:  . ./completions/bm_utils
+
+_bm_utils() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local subcommands="install inject_gyro extract_gyro"
+
+    # First argument slot: offer the subcommands (and help).
+    if [ "${COMP_CWORD}" -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$subcommands -h --help" -- "$cur") )
+        return 0
+    fi
+
+    # Anything deeper: let bash's default file-name completion take over
+    # (handy for the .braw / .gcsv arguments).
+    return 0
+}
+
+complete -F _bm_utils bm_utils

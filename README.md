@@ -38,8 +38,11 @@ BRAW reader is actually consuming the embedded track.
 
 | File | Purpose |
 |---|---|
+| [`bm_utils`](bm_utils) | The single entry point: `bm_utils inject_gyro \| extract_gyro \| install`. Run it straight from the repo, or via the nix package. |
+| [`completions/bm_utils`](completions/bm_utils) | Bash tab-completion for `bm_utils` (subcommands + file names). |
 | [`inject_gyro_into_braw.py`](inject_gyro_into_braw.py) | `.gcsv` → `.braw`: embed a Gyroflow IMU log into a BRAW file as a native MP4 metadata track. |
 | [`extract_gyro_from_braw.py`](extract_gyro_from_braw.py) | `.braw` → `.gcsv`: read the IMU embedded in a BRAW file and write a standard Gyroflow `.gcsv`. |
+| [`scripts/`](scripts/) | Fusion post-render hooks installed by `bm_utils install` into `~/.local/share/DaVinciResolve/Fusion/Scripts`. |
 
 ## How it works (the short version)
 
@@ -71,10 +74,14 @@ preserved.
 
 ## Usage
 
+Everything is driven through the single `bm_utils` command (add `--help` to any
+subcommand for its options). The two Python files above are the subcommands'
+engines; you don't call them directly.
+
 ### Inject a GCSV into a BRAW
 
 ```bash
-python3 inject_gyro_into_braw.py INPUT.braw INPUT.gcsv [options]
+bm_utils inject_gyro INPUT.braw INPUT.gcsv [options]
 ```
 
 By default this writes `INPUT_injected.braw` (the original is left untouched).
@@ -94,7 +101,7 @@ every sample round-trips, and it refuses to clobber the input file.
 ### Extract a GCSV from a BRAW
 
 ```bash
-python3 extract_gyro_from_braw.py INPUT.braw [options]
+bm_utils extract_gyro INPUT.braw [options]
 ```
 
 By default this writes `INPUT.gcsv`.
@@ -113,6 +120,39 @@ Options:
 
 The produced `.gcsv` can be loaded directly in Gyroflow as a sidecar, or fed
 back through the injector.
+
+## Installing & running
+
+**Straight from the repo** (no nix needed) — `bm_utils` is a self-locating
+bash script, so it works when run in place. It needs `python3` on the `PATH`:
+
+```bash
+./bm_utils inject_gyro in.braw in.gcsv
+```
+
+**As a nix package** — this is a flake. Build it and `bm_utils` lands on your
+`PATH` (along with the inject/extract engines and the `scripts/` payload):
+
+```bash
+nix build                       # or: nix run .#blackmagic-utils
+bm_utils install               # install the Fusion post-render scripts
+```
+
+`nix develop` gives a shell with `bm_utils` (and the completion) already loaded.
+
+### Tab completion
+
+`completions/bm_utils` is a standard bash-completion file. It is installed to
+`share/bash-completion/completions/bm_utils`, so it loads automatically if you
+have the [`bash-completion`](https://github.com/bash-git/bash-completion)
+package enabled. To use it in a shell without that, source it:
+
+```bash
+. /path/to/completions/bm_utils
+```
+
+Afterwards `bm_utils <TAB>` completes the subcommands and `<TAB>` on an
+argument completes file names.
 
 ## Round-trip
 
