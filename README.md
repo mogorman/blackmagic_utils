@@ -179,6 +179,17 @@ error ~1e-7). Timestamps round-trip exactly.
 - **Not a general MP4 editor:** these scripts are purpose-built for the BRAW
   IMU track. They are not a general-purpose MP4 muxer.
 
+## Related projects
+
+| Project | What it does |
+|---|---|
+| [Gyroflow](https://github.com/mogorman/gyroflow) | Video stabilization using gyroscope data — the app these tools feed data into. |
+| [Gyroflow plugins](https://github.com/mogorman/gyroflow-plugins) | Video-editor plugins (OpenFX / Adobe / frei0r) for applying stabilization inside your NLE. |
+| [VST for Resolve on Linux](https://github.com/mogorman/VSTForResolveLinux) | Runs VST2 / VST3 / CLAP audio plugins inside DaVinci Resolve on Linux — which Blackmagic doesn't support. |
+| [Magic Pocket Control (ESP32)](https://github.com/mogorman/Magic-Pocket-Control-ESP32) | ESP32 device that wirelessly controls Blackmagic cameras over Bluetooth LE. |
+| [senseflow-to-gcsv](https://github.com/mogorman/senseflow-to-gcsv) | Converts NiYien SenseFlow-A1 `.bin` gyro logs into Gyroflow `.gcsv` format. |
+| [shuttle-go](https://github.com/mogorman/shuttle-go) | Linux driver for the Contour Design Shuttle Pro V2, with better GNOME/Wayland support. |
+
 ## License
 
 GPL-3.0-or-later — see [LICENSE](LICENSE).
