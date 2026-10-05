@@ -28,6 +28,17 @@ import struct
 import sys
 from pathlib import Path
 
+try:
+    from inject_audio_into_braw import (
+        Wav, slice_wav, slice_wav_offset,
+        build_audio_track, build_audio_stsd, build_audio_stts,
+        build_audio_stsc, build_audio_stsz,
+        read_braw_timecode, read_braw_duration, parse_tc, format_tc,
+    )
+    HAS_AUDIO = True
+except ImportError:
+    HAS_AUDIO = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -549,7 +560,11 @@ def build_track(track_id, timescale, duration, stbl_boxes):
 # Splicing into the container
 # ---------------------------------------------------------------------------
 
-def inject(braw_path, gcsv, args):
+def inject(braw_path, gcsv, args, audio_tracks=None):
+    """
+    Inject IMU data (and optionally audio tracks) into a BRAW file.
+    audio_tracks: optional list of (Wav, pcm_bytes, num_frames) tuples.
+    """
     buf = bytearray(Path(braw_path).read_bytes())
 
     # --- orientation / permutation ---
@@ -583,8 +598,10 @@ def inject(braw_path, gcsv, args):
         raise RuntimeError("No 'mdat' box found in BRAW file")
     mdat_start, mdat_size, mdat_poff = mdat
 
-    # Pick a track id that does not collide with existing tracks.
-    track_id = _pick_track_id(buf, moov_poff, moov_size)
+    # Pick track ids that do not collide with existing tracks.
+    num_new_tracks = 1 + (len(audio_tracks) if audio_tracks else 0)
+    track_ids = _pick_track_ids(buf, moov_poff, moov_size, num_new_tracks)
+    track_id = track_ids[0]
 
     timescale = args.timescale
     duration = max(emitted_t) if emitted_t else 0
@@ -593,42 +610,46 @@ def inject(braw_path, gcsv, args):
     # Splice strategy
     # ------------------------------------------------------------------
     # We preserve the original top-level box order and *replace* the existing
-    # moov in place with a grown one (old moov payload + new trak). The new
-    # IMU sample payload is appended to the end of the file, and the mdat box
-    # is grown to span up to and including that payload.
+    # moov in place with a grown one (old moov payload + new traks). The new
+    # sample payloads (IMU + audio) are appended to the end of the file, and
+    # the mdat box is grown to span up to and including those payloads.
     #
-    # Because the original file has exactly one moov (at the end, after mdat),
-    # the new file layout is:
+    # New file layout:
     #   [boxes before mdat] [mdat' (grown)] [moov' (grown)]
     #
-    # where mdat' = old mdat payload + appended payload, and moov' = old moov
-    # payload + new trak. The stco chunk offset points to the start of the
-    # appended payload inside mdat'.
+    # where mdat' = old mdat payload + appended payloads, and moov' = old moov
+    # payload + new traks. Each trak's stco points to its payload in mdat'.
 
     old_mdat_payload = bytes(buf[mdat_poff:mdat_start + mdat_size])
     old_moov_payload = bytes(buf[moov_poff:moov_start + moov_size])
     before_mdat = bytes(buf[:mdat_start])
     after_moov = bytes(buf[moov_start + moov_size:])
 
-    new_mdat_payload = old_mdat_payload + payload
+    # Build the combined new payload: IMU first, then audio tracks.
+    all_payloads = [payload]
+    if audio_tracks:
+        for _wav, pcm, _nf in audio_tracks:
+            all_payloads.append(pcm)
+    combined_payload = b"".join(all_payloads)
+    new_mdat_payload = old_mdat_payload + combined_payload
 
     # The mdat box header is 8 bytes (u32 size + 4CC) normally, but 16 bytes
-    # (u32 size=1 + 4CC + u64 largesize) when the box is >= 4 GB. We need the
-    # header size to (a) compute the payload's absolute offset and (b) emit the
-    # correct box header, so decide it up front.
+    # (u32 size=1 + 4CC + u64 largesize) when the box is >= 4 GB.
     new_mdat_total = 8 + len(new_mdat_payload)
     mdat_uses_largesize = new_mdat_total > 0xFFFFFFFF
     mdat_header_size = 16 if mdat_uses_largesize else 8
 
-    # The appended payload begins at:
-    #   mdat' start + mdat header size + len(old_mdat_payload)
-    # mdat' start = len(before_mdat)  (mdat' replaces mdat at the same position)
     mdat_final_start = len(before_mdat)
-    payload_abs_offset = mdat_final_start + mdat_header_size + len(old_mdat_payload)
+    payload_abs_base = mdat_final_start + mdat_header_size + len(old_mdat_payload)
 
-    def make_trak(chunk_offset):
-        # Use 64-bit chunk offsets (co64) when the offset exceeds the u32 range,
-        # otherwise the standard 32-bit stco.
+    # Compute absolute offset for each payload.
+    payload_offsets = []
+    cum = 0
+    for p in all_payloads:
+        payload_offsets.append(payload_abs_base + cum)
+        cum += len(p)
+
+    def make_imu_trak(chunk_offset):
         if chunk_offset > 0xFFFFFFFF:
             chunk_box = build_co64(chunk_offset, num_samples)
         else:
@@ -643,7 +664,30 @@ def inject(braw_path, gcsv, args):
         ]
         return build_track(track_id, timescale, duration, stbl)
 
-    new_moov_payload = old_moov_payload + make_trak(payload_abs_offset)
+    # Build all new traks: IMU first, then audio.
+    new_traks = bytearray()
+    new_traks += make_imu_trak(payload_offsets[0])
+
+    if audio_tracks:
+        for i, (wav, pcm, num_frames) in enumerate(audio_tracks):
+            a_track_id = track_ids[1 + i]
+            a_chunk_offset = payload_offsets[1 + i]
+            if a_chunk_offset > 0xFFFFFFFF:
+                a_chunk_box = build_co64(a_chunk_offset, num_frames)
+            else:
+                a_chunk_box = build_stco(a_chunk_offset, num_frames)
+            a_stbl = [
+                build_audio_stsd(wav),
+                build_audio_stts(num_frames),
+                build_audio_stsc(num_frames),
+                a_chunk_box,
+                build_audio_stsz(num_frames, wav.frame_size),
+            ]
+            new_traks += build_audio_track(
+                a_track_id, wav.sample_rate, num_frames, a_stbl
+            )
+
+    new_moov_payload = old_moov_payload + bytes(new_traks)
 
     # Emit mdat with the header size we already decided (8 or 16 bytes). Emit
     # moov with a 64-bit 'largesize' header only if it itself exceeds the u32
@@ -667,12 +711,17 @@ def inject(braw_path, gcsv, args):
     out_path = Path(args.output) if args.output else _default_output(braw_path)
     out_path.write_bytes(bytes(out))
 
-    print("Wrote %s (%d bytes, %d IMU samples, track id 0x%02X, timescale %d)"
-          % (out_path, len(out), len(gcsv.samples), track_id, timescale))
+    num_audio = len(audio_tracks) if audio_tracks else 0
+    print("Wrote %s (%d bytes, %d IMU samples, %d audio track(s), track id 0x%02X)"
+           % (out_path, len(out), len(gcsv.samples), num_audio, track_id))
     print("  mogy/moac sample boxes: %d (each 20 bytes)" % num_samples)
     actual_mdat_size = (16 if mdat_uses_largesize else 8) + len(new_mdat_payload)
-    print("  payload at file offset %d (mdat now %d bytes, %s header)"
-          % (payload_abs_offset, actual_mdat_size, "64-bit" if mdat_uses_largesize else "32-bit"))
+    print("  IMU payload at file offset %d (mdat now %d bytes, %s header)"
+           % (payload_offsets[0], actual_mdat_size, "64-bit" if mdat_uses_largesize else "32-bit"))
+    if audio_tracks:
+        for i, (wav, pcm, nf) in enumerate(audio_tracks):
+            print("  audio track %d: id=%d, %d Hz, %d frames, offset=%d"
+                  % (i + 1, track_ids[1 + i], wav.sample_rate, nf, payload_offsets[1 + i]))
 
     if not args.no_verify:
         ok = verify(out_path, gcsv, perm, not args.no_accel_negate)
@@ -720,6 +769,39 @@ def _pick_track_id(buf, moov_poff, moov_size):
     while candidate in used:
         candidate += 1
     return candidate
+
+
+def _pick_track_ids(buf, moov_poff, moov_size, count):
+    """Pick `count` unique track IDs that don't collide with existing tracks."""
+    used = set()
+    pos = moov_poff
+    end = moov_poff + (moov_size - 8)
+    while pos + 8 <= end:
+        size = struct.unpack(">I", buf[pos:pos + 4])[0]
+        name = buf[pos + 4:pos + 8]
+        if size < 8 or pos + size > end:
+            break
+        if name == b"trak":
+            tkhd_start = pos + 8
+            if tkhd_start + 28 <= end and buf[tkhd_start + 4:tkhd_start + 8] == b"tkhd":
+                ver_flags = struct.unpack(">I", buf[tkhd_start + 8:tkhd_start + 12])[0]
+                version = ver_flags >> 24
+                if version == 0:
+                    off = tkhd_start + 8 + 4 + 4 + 4
+                else:
+                    off = tkhd_start + 8 + 4 + 8 + 8
+                tid = struct.unpack(">I", buf[off:off + 4])[0]
+                used.add(tid)
+        pos += size
+
+    ids = []
+    candidate = 1
+    while len(ids) < count:
+        if candidate not in used:
+            ids.append(candidate)
+            used.add(candidate)
+        candidate += 1
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -964,14 +1046,73 @@ def verify(out_path, gcsv, perm, negate_accel):
 # CLI
 # ---------------------------------------------------------------------------
 
+def main_all(args):
+    """Process all .braw/.gcsv pairs in the current directory."""
+    if args.no_verify:
+        print("error: --all requires verification (cannot use --no-verify)", file=sys.stderr)
+        return 2
+    if args.braw or args.gcsv:
+        print("error: --all cannot be combined with positional braw/gcsv arguments", file=sys.stderr)
+        return 2
+
+    cwd = Path(".")
+    braws = sorted(cwd.glob("*.braw"))
+    pairs = []
+    for b in braws:
+        g = b.with_suffix(".gcsv")
+        if g.exists():
+            pairs.append((b, g))
+
+    if not pairs:
+        print("No .braw files with matching .gcsv found in %s" % cwd.resolve())
+        return 0
+
+    print("Found %d pair(s) to process:\n" % len(pairs))
+    for b, g in pairs:
+        print("  %s + %s" % (b.name, g.name))
+    print()
+
+    for braw_path, gcsv_path in pairs:
+        stem = braw_path.stem
+        temp_out = braw_path.with_name(stem + "_injected" + braw_path.suffix)
+        final_out = braw_path.with_name(stem + "_g" + braw_path.suffix)
+
+        print("Processing: %s" % braw_path.name)
+
+        try:
+            gcsv = Gcsv.parse(str(gcsv_path))
+        except Exception as e:
+            print("error: failed to parse %s: %s" % (gcsv_path.name, e), file=sys.stderr)
+            return 1
+        print("  %d samples, orientation=%r" % (len(gcsv.samples), gcsv.orientation))
+
+        args.braw = str(braw_path)
+        args.gcsv = str(gcsv_path)
+        args.output = str(temp_out)
+
+        rc = inject(str(braw_path), gcsv, args)
+        if rc != 0:
+            print("error: injection/verify failed for %s -- stopping" % braw_path.name, file=sys.stderr)
+            return 1
+
+        braw_path.unlink()
+        temp_out.rename(final_out)
+        print("  OK: %s -> %s (original deleted)\n" % (braw_path.name, final_out.name))
+
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Inject gyro/accel from a .gcsv into a .braw file as a native "
                     "MP4 metadata track (no sidecar).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("braw", help="input .braw file")
-    ap.add_argument("gcsv", help="input .gcsv file (matching the video)")
+    ap.add_argument("braw", nargs="?", default=None, help="input .braw file")
+    ap.add_argument("gcsv", nargs="?", default=None, help="input .gcsv file (matching the video)")
+    ap.add_argument("--all", action="store_true",
+                    help="process all .braw files with matching .gcsv in the current directory; "
+                         "on success the original is deleted and the output renamed to <name>_g.braw")
     ap.add_argument("-o", "--output", default=None,
                     help="output path (default: <input>_injected.braw)")
     ap.add_argument("--orientation", default=None,
@@ -984,7 +1125,23 @@ def main(argv=None):
                     help="metadata track timescale (default: 1000 = ms)")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the built-in re-parse verification")
+    ap.add_argument("--audio", nargs="+", default=None, metavar="WAV",
+                    help="additionally inject these WAV file(s) as audio tracks (1-16)")
+    ap.add_argument("--wav-start-tc", default=None,
+                    help="WAV start timecode HH:MM:SS:FF (default: auto from BWF)")
+    ap.add_argument("--braw-start-tc", default=None,
+                    help="override BRAW start timecode HH:MM:SS:FF (default: auto)")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="frame rate for timecode (default: auto from BRAW)")
+    ap.add_argument("--offset", type=float, default=None,
+                    help="direct audio offset in seconds (bypasses TC math)")
     args = ap.parse_args(argv)
+
+    if args.all:
+        return main_all(args)
+
+    if not args.braw or not args.gcsv:
+        ap.error("braw and gcsv are required (or use --all)")
 
     if not Path(args.braw).exists():
         print("error: BRAW file not found: %s" % args.braw, file=sys.stderr)
@@ -1005,8 +1162,56 @@ def main(argv=None):
         print("  frame_readout_time=%g ms (note: BRAW parser computes its own from meta; "
               "this value is not written into the BRAW)" % gcsv.frame_readout_time)
 
+    # --- Parse audio tracks (if requested) ---
+    audio_tracks = None
+    if args.audio:
+        if not HAS_AUDIO:
+            print("error: --audio requires inject_audio_into_braw.py (not found)", file=sys.stderr)
+            return 2
+        if len(args.audio) > 16:
+            print("error: maximum 16 audio tracks supported", file=sys.stderr)
+            return 2
+        for wf in args.audio:
+            if not Path(wf).exists():
+                print("error: WAV file not found: %s" % wf, file=sys.stderr)
+                return 2
+
+        braw_buf = Path(args.braw).read_bytes()
+        braw_tc_s, braw_fps = read_braw_timecode(braw_buf)
+        braw_dur_s = read_braw_duration(braw_buf)
+        if braw_dur_s is None:
+            print("error: could not read BRAW duration", file=sys.stderr)
+            return 2
+        fps = args.fps if args.fps is not None else (braw_fps if braw_fps else 25.0)
+        if args.braw_start_tc:
+            braw_start_tc_s = parse_tc(args.braw_start_tc, fps)
+        elif braw_tc_s is not None:
+            braw_start_tc_s = braw_tc_s
+        else:
+            braw_start_tc_s = 0.0
+
+        print("Audio: BRAW start TC=%s, duration=%.3f s, fps=%.3f"
+              % (format_tc(braw_start_tc_s, fps), braw_dur_s, fps))
+        audio_tracks = []
+        for wf in args.audio:
+            wav = Wav.parse(wf)
+            if args.wav_start_tc:
+                wav_tc = parse_tc(args.wav_start_tc, fps)
+            elif wav.bwf_start_tc_s is not None:
+                wav_tc = wav.bwf_start_tc_s
+            else:
+                wav_tc = 0.0
+            if args.offset is not None:
+                pcm, nf = slice_wav_offset(wav, args.offset, braw_dur_s)
+            else:
+                pcm, nf = slice_wav(wav, braw_start_tc_s, wav_tc, braw_dur_s)
+            audio_tracks.append((wav, pcm, nf))
+            print("  %s: %d Hz, %d ch, %d-bit, sliced %d frames (%.2f s)"
+                  % (wf, wav.sample_rate, wav.channels, wav.bits_per_sample,
+                     nf, nf / wav.sample_rate))
+
     print("Injecting into BRAW: %s" % args.braw)
-    rc = inject(args.braw, gcsv, args)
+    rc = inject(args.braw, gcsv, args, audio_tracks)
     return rc
 
 
