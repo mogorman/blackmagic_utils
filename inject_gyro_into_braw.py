@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import csv
+import os
 import struct
 import sys
 from pathlib import Path
@@ -33,7 +34,8 @@ try:
         Wav, slice_wav, slice_wav_offset,
         build_audio_track, build_audio_stsd, build_audio_stts,
         build_audio_stsc, build_audio_stsz,
-        read_braw_timecode, read_braw_duration, parse_tc, format_tc,
+        read_timecode_from_moov_payload, read_duration_from_moov_payload,
+        parse_tc, format_tc,
     )
     HAS_AUDIO = True
 except ImportError:
@@ -342,6 +344,74 @@ def patch_box_size(buf, start, new_size):
     struct.pack_into(">I", buf, start, new_size)
 
 
+def iter_top_level_boxes_stream(f, fsize):
+    """
+    Yield (name, start, size, poff) for each top-level box by streaming header
+    reads from an open binary file. O(1) memory -- the file is never loaded.
+    """
+    pos = 0
+    n = fsize
+    while pos + 8 <= n:
+        f.seek(pos)
+        hdr = f.read(8)
+        if len(hdr) < 8:
+            break
+        size = struct.unpack(">I", hdr[0:4])[0]
+        name = hdr[4:8]
+        header = 8
+        if size == 1:
+            ls = f.read(8)
+            if len(ls) < 8:
+                break
+            size = struct.unpack(">Q", ls)[0]
+            header = 16
+        elif size == 0:
+            size = n - pos
+        if size < header or pos + size > n:
+            break
+        yield name, pos, size, pos + header
+        pos += size
+
+
+def find_top_level_boxes_stream(f, fsize, names):
+    """Return {name_bytes: (start, size, poff)} for the wanted top-level boxes."""
+    wanted = set()
+    for x in names:
+        wanted.add(x.encode("ascii") if isinstance(x, str) else x)
+    found = {}
+    for name, start, size, poff in iter_top_level_boxes_stream(f, fsize):
+        if name in wanted:
+            found.setdefault(name, (start, size, poff))
+        if len(found) == len(wanted):
+            break
+    return found
+
+
+def _read_moov_payload_streaming(path):
+    """Return the moov box payload bytes for `path`, streaming the box headers
+    (O(1) memory). Returns None if no moov box is found."""
+    fsize = os.path.getsize(path)
+    with open(path, "rb") as f:
+        boxes = find_top_level_boxes_stream(f, fsize, ("moov",))
+        if b"moov" not in boxes:
+            return None
+        moov_start, moov_size, moov_poff = boxes[b"moov"]
+        f.seek(moov_poff)
+        return f.read((moov_start + moov_size) - moov_poff)
+
+
+def copy_range_stream(f_in, start, length, f_out, chunk=8 * 1024 * 1024):
+    """Copy `length` bytes from f_in starting at `start` to f_out, in chunks."""
+    f_in.seek(start)
+    remaining = length
+    while remaining > 0:
+        data = f_in.read(min(chunk, remaining))
+        if not data:
+            break
+        f_out.write(data)
+        remaining -= len(data)
+
+
 # ---------------------------------------------------------------------------
 # Building the new metadata track
 # ---------------------------------------------------------------------------
@@ -564,9 +634,11 @@ def inject(braw_path, gcsv, args, audio_tracks=None):
     """
     Inject IMU data (and optionally audio tracks) into a BRAW file.
     audio_tracks: optional list of (Wav, pcm_bytes, num_frames) tuples.
-    """
-    buf = bytearray(Path(braw_path).read_bytes())
 
+    Streams the (multi-GB) mdat payload directly from input to output, so peak
+    memory is O(moov + IMU/audio payload) rather than a multiple of the file
+    size. The output is written to a temp file and renamed into place on success.
+    """
     # --- orientation / permutation ---
     perm = (0, 1, 2)
     if not args.no_remap:
@@ -574,7 +646,7 @@ def inject(braw_path, gcsv, args, audio_tracks=None):
         for w in orient_warnings:
             print("  [orientation] " + w, file=sys.stderr)
 
-    # --- build sample payload ---
+    # --- build sample payload (small; kept in memory) ---
     # Each GCSV sample yields up to two 20-byte boxes (mogy, moac) sharing the
     # same timestamp. stts is per emitted box, so we expand the timestamp list.
     emitted_t = []
@@ -587,62 +659,56 @@ def inject(braw_path, gcsv, args, audio_tracks=None):
         gcsv.samples, perm, not args.no_accel_negate
     )
 
-    # --- locate moov and mdat ---
-    moov = find_box(buf, "moov")
-    if moov is None:
-        raise RuntimeError("No 'moov' box found in BRAW file")
-    moov_start, moov_size, moov_poff = moov
+    # Combined payload to append: IMU first, then audio tracks (all small enough
+    # to hold in memory).
+    all_payloads = [payload]
+    if audio_tracks:
+        for _wav, pcm, _nf in audio_tracks:
+            all_payloads.append(pcm)
+    combined_payload_len = sum(len(p) for p in all_payloads)
 
-    mdat = find_box(buf, "mdat")
-    if mdat is None:
-        raise RuntimeError("No 'mdat' box found in BRAW file")
-    mdat_start, mdat_size, mdat_poff = mdat
+    # --- locate moov + mdat by streaming the box headers (O(1) memory) ---
+    in_size = os.path.getsize(braw_path)
+    with open(braw_path, "rb") as f:
+        boxes = find_top_level_boxes_stream(f, in_size, ("moov", "mdat"))
+        if b"moov" not in boxes or b"mdat" not in boxes:
+            raise RuntimeError("BRAW file must contain both 'moov' and 'mdat' boxes")
+        moov_start, moov_size, moov_poff = boxes[b"moov"]
+        mdat_start, mdat_size, mdat_poff = boxes[b"mdat"]
+        if moov_start < mdat_start:
+            raise RuntimeError("Unsupported BRAW layout: expected 'mdat' before 'moov'")
+        # moov is small: read it whole (needed for track-id pick + as base payload)
+        f.seek(moov_poff)
+        old_moov_payload = f.read((moov_start + moov_size) - moov_poff)
 
     # Pick track ids that do not collide with existing tracks.
     num_new_tracks = 1 + (len(audio_tracks) if audio_tracks else 0)
-    track_ids = _pick_track_ids(buf, moov_poff, moov_size, num_new_tracks)
+    track_ids = _pick_track_ids_from_moov_payload(old_moov_payload, num_new_tracks)
     track_id = track_ids[0]
 
     timescale = args.timescale
     duration = max(emitted_t) if emitted_t else 0
 
     # ------------------------------------------------------------------
-    # Splice strategy
+    # Splice strategy (streamed)
     # ------------------------------------------------------------------
-    # We preserve the original top-level box order and *replace* the existing
-    # moov in place with a grown one (old moov payload + new traks). The new
-    # sample payloads (IMU + audio) are appended to the end of the file, and
-    # the mdat box is grown to span up to and including those payloads.
-    #
-    # New file layout:
-    #   [boxes before mdat] [mdat' (grown)] [moov' (grown)]
-    #
-    # where mdat' = old mdat payload + appended payloads, and moov' = old moov
-    # payload + new traks. Each trak's stco points to its payload in mdat'.
+    # We preserve the original top-level box order and rebuild the file as:
+    #   [boxes before mdat] [mdat' (grown)] [moov' (grown)] [boxes after moov]
+    # where mdat' = old mdat payload (streamed, not buffered) + appended payloads,
+    # and moov' = old moov payload + new traks. Each trak's stco points to its
+    # payload in mdat'. All sizes/offsets are computed without holding the data.
 
-    old_mdat_payload = bytes(buf[mdat_poff:mdat_start + mdat_size])
-    old_moov_payload = bytes(buf[moov_poff:moov_start + moov_size])
-    before_mdat = bytes(buf[:mdat_start])
-    after_moov = bytes(buf[moov_start + moov_size:])
+    before_mdat_len = mdat_start
+    old_mdat_payload_len = (mdat_start + mdat_size) - mdat_poff
+    new_mdat_payload_len = old_mdat_payload_len + combined_payload_len
 
-    # Build the combined new payload: IMU first, then audio tracks.
-    all_payloads = [payload]
-    if audio_tracks:
-        for _wav, pcm, _nf in audio_tracks:
-            all_payloads.append(pcm)
-    combined_payload = b"".join(all_payloads)
-    new_mdat_payload = old_mdat_payload + combined_payload
-
-    # The mdat box header is 8 bytes (u32 size + 4CC) normally, but 16 bytes
-    # (u32 size=1 + 4CC + u64 largesize) when the box is >= 4 GB.
-    new_mdat_total = 8 + len(new_mdat_payload)
-    mdat_uses_largesize = new_mdat_total > 0xFFFFFFFF
+    # mdat header is 8 bytes normally, 16 bytes (64-bit largesize) if >= 4 GB.
+    mdat_uses_largesize = (8 + new_mdat_payload_len) > 0xFFFFFFFF
     mdat_header_size = 16 if mdat_uses_largesize else 8
 
-    mdat_final_start = len(before_mdat)
-    payload_abs_base = mdat_final_start + mdat_header_size + len(old_mdat_payload)
+    payload_abs_base = mdat_start + mdat_header_size + old_mdat_payload_len
 
-    # Compute absolute offset for each payload.
+    # Absolute offset of each appended payload.
     payload_offsets = []
     cum = 0
     for p in all_payloads:
@@ -688,36 +754,44 @@ def inject(braw_path, gcsv, args, audio_tracks=None):
             )
 
     new_moov_payload = old_moov_payload + bytes(new_traks)
-
-    # Emit mdat with the header size we already decided (8 or 16 bytes). Emit
-    # moov with a 64-bit 'largesize' header only if it itself exceeds the u32
-    # range (rare; moov is small unless the original had a huge number of tracks).
-    if mdat_uses_largesize:
-        new_mdat_box = box64("mdat", new_mdat_payload)
-    else:
-        new_mdat_box = box("mdat", new_mdat_payload)
-
     if 8 + len(new_moov_payload) > 0xFFFFFFFF:
         new_moov_box = box64("moov", new_moov_payload)
     else:
         new_moov_box = box("moov", new_moov_payload)
 
-    out = bytearray()
-    out += before_mdat
-    out += new_mdat_box
-    out += new_moov_box
-    out += after_moov
-
+    # --- stream the output ---
     out_path = Path(args.output) if args.output else _default_output(braw_path)
-    out_path.write_bytes(bytes(out))
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    try:
+        with open(braw_path, "rb") as f_in, open(tmp_path, "wb") as f_out:
+            copy_range_stream(f_in, 0, before_mdat_len, f_out)
+            if mdat_uses_largesize:
+                f_out.write(struct.pack(">I4sQ", 1, b"mdat",
+                                        16 + new_mdat_payload_len))
+            else:
+                f_out.write(struct.pack(">I4s", 8 + new_mdat_payload_len, b"mdat"))
+            copy_range_stream(f_in, mdat_poff, old_mdat_payload_len, f_out)
+            for p in all_payloads:
+                f_out.write(p)
+            f_out.write(new_moov_box)
+            copy_range_stream(f_in, moov_start + moov_size,
+                              in_size - (moov_start + moov_size), f_out)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
+    out_total = (before_mdat_len + mdat_header_size + new_mdat_payload_len
+                 + len(new_moov_box) + (in_size - (moov_start + moov_size)))
     num_audio = len(audio_tracks) if audio_tracks else 0
     print("Wrote %s (%d bytes, %d IMU samples, %d audio track(s), track id 0x%02X)"
-           % (out_path, len(out), len(gcsv.samples), num_audio, track_id))
+           % (out_path, out_total, len(gcsv.samples), num_audio, track_id))
     print("  mogy/moac sample boxes: %d (each 20 bytes)" % num_samples)
-    actual_mdat_size = (16 if mdat_uses_largesize else 8) + len(new_mdat_payload)
+    actual_mdat_size = mdat_header_size + new_mdat_payload_len
     print("  IMU payload at file offset %d (mdat now %d bytes, %s header)"
-           % (payload_offsets[0], actual_mdat_size, "64-bit" if mdat_uses_largesize else "32-bit"))
+           % (payload_offsets[0], actual_mdat_size,
+              "64-bit" if mdat_uses_largesize else "32-bit"))
     if audio_tracks:
         for i, (wav, pcm, nf) in enumerate(audio_tracks):
             print("  audio track %d: id=%d, %d Hz, %d frames, offset=%d"
@@ -804,187 +878,223 @@ def _pick_track_ids(buf, moov_poff, moov_size, count):
     return ids
 
 
+def _pick_track_ids_from_moov_payload(payload, count):
+    """Pick `count` unique track IDs that don't collide with tracks in a moov
+    *payload* buffer (0-based offsets; no full-file buffer needed)."""
+    used = set()
+    pos = 0
+    end = len(payload)
+    while pos + 8 <= end:
+        size = struct.unpack(">I", payload[pos:pos + 4])[0]
+        name = payload[pos + 4:pos + 8]
+        if size < 8 or pos + size > end:
+            break
+        if name == b"trak":
+            tkhd_start = pos + 8
+            if tkhd_start + 28 <= end and payload[tkhd_start + 4:tkhd_start + 8] == b"tkhd":
+                ver_flags = struct.unpack(">I", payload[tkhd_start + 8:tkhd_start + 12])[0]
+                version = ver_flags >> 24
+                if version == 0:
+                    off = tkhd_start + 8 + 4 + 4 + 4
+                else:
+                    off = tkhd_start + 8 + 4 + 8 + 8
+                tid = struct.unpack(">I", payload[off:off + 4])[0]
+                used.add(tid)
+        pos += size
+
+    ids = []
+    candidate = 1
+    while len(ids) < count:
+        if candidate not in used:
+            ids.append(candidate)
+            used.add(candidate)
+        candidate += 1
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Verification: re-parse the output the way the BRAW parser does
 # ---------------------------------------------------------------------------
 
 def verify(out_path, gcsv, perm, negate_accel):
     """
-    Re-open the output file, locate the metadata track we just wrote, decode its
+    Re-open the output, locate the metadata track we just wrote, decode its
     mogy/moac samples, and compare against the source GCSV (after the same
     permutation + accel negation the BRAW parser will apply on read).
+
+    Seek-based: only the moov box and the IMU sample region are read, so memory
+    stays small even for huge output files.
     """
     print("  [verify] re-parsing %s" % out_path)
-    buf = Path(out_path).read_bytes()
+    fsize = os.path.getsize(out_path)
 
-    # Find the moov, then the trak whose hdlr is 'meta' and whose stsz count
-    # matches our sample count.
-    moov = find_box(buf, "moov")
-    if moov is None:
-        print("    FAIL: no moov in output")
-        return False
-    moov_start, moov_size, moov_poff = moov
+    abs_t = []
+    with open(out_path, "rb") as f:
+        boxes = find_top_level_boxes_stream(f, fsize, ("moov", "mdat"))
+        if b"moov" not in boxes:
+            print("    FAIL: no moov in output")
+            return False
+        if b"mdat" not in boxes:
+            print("    FAIL: no mdat in output")
+            return False
+        moov_start, moov_size, moov_poff = boxes[b"moov"]
+        mdat_start, mdat_size, mdat_poff = boxes[b"mdat"]
 
-    # Walk moov children to find trak boxes.
-    traks = []
-    pos = moov_poff
-    end = moov_poff + (moov_size - 8)
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        if size < 8 or pos + size > end:
-            break
-        if name == b"trak":
-            traks.append((pos, size))
-        pos += size
+        # Read the (small) moov payload; all table offsets below are 0-based
+        # within it.
+        f.seek(moov_poff)
+        mb = f.read((moov_start + moov_size) - moov_poff)
 
-    if not traks:
-        print("    FAIL: no trak boxes found in moov")
-        return False
+        # Walk moov children to find trak boxes.
+        traks = []
+        pos = 0
+        end = len(mb)
+        while pos + 8 <= end:
+            size = struct.unpack(">I", mb[pos:pos + 4])[0]
+            name = mb[pos + 4:pos + 8]
+            if size < 8 or pos + size > end:
+                break
+            if name == b"trak":
+                traks.append((pos, size))
+            pos += size
 
-    # Find the metadata track (hdlr type 'meta').
-    meta_trak = None
-    for tpos, tsize in traks:
-        # walk trak children: tkhd, mdia
+        if not traks:
+            print("    FAIL: no trak boxes found in moov")
+            return False
+
+        # Find the metadata track (hdlr type 'meta').
+        meta_trak = None
+        for tpos, tsize in traks:
+            cpos = tpos + 8
+            cend = tpos + tsize
+            hdlr_type = None
+            while cpos + 8 <= cend:
+                csize = struct.unpack(">I", mb[cpos:cpos + 4])[0]
+                cname = mb[cpos + 4:cpos + 8]
+                if csize < 8 or cpos + csize > cend:
+                    break
+                if cname == b"mdia":
+                    mpos = cpos + 8
+                    mend = cpos + csize
+                    while mpos + 8 <= mend:
+                        msize = struct.unpack(">I", mb[mpos:mpos + 4])[0]
+                        mname = mb[mpos + 4:mpos + 8]
+                        if msize < 8 or mpos + msize > mend:
+                            break
+                        if mname == b"hdlr":
+                            ht = mb[mpos + 8 + 4 + 4:mpos + 8 + 4 + 4 + 4]
+                            hdlr_type = ht
+                        mpos += msize
+                cpos += csize
+            if hdlr_type == b"meta":
+                meta_trak = (tpos, tsize)
+                break
+
+        if meta_trak is None:
+            print("    FAIL: no metadata (hdlr 'meta') track found")
+            return False
+
+        tpos, tsize = meta_trak
+        # Extract stts, stsz, and the chunk-offset box (stco or co64) from this trak.
+        stts = None
+        stsz = None
+        chunk_box = None   # (offset, len, is_co64)
         cpos = tpos + 8
         cend = tpos + tsize
-        hdlr_type = None
         while cpos + 8 <= cend:
-            csize = struct.unpack(">I", buf[cpos:cpos + 4])[0]
-            cname = buf[cpos + 4:cpos + 8]
+            csize = struct.unpack(">I", mb[cpos:cpos + 4])[0]
+            cname = mb[cpos + 4:cpos + 8]
             if csize < 8 or cpos + csize > cend:
                 break
             if cname == b"mdia":
-                # walk mdia children for hdlr
                 mpos = cpos + 8
                 mend = cpos + csize
                 while mpos + 8 <= mend:
-                    msize = struct.unpack(">I", buf[mpos:mpos + 4])[0]
-                    mname = buf[mpos + 4:mpos + 8]
+                    msize = struct.unpack(">I", mb[mpos:mpos + 4])[0]
+                    mname = mb[mpos + 4:mpos + 8]
                     if msize < 8 or mpos + msize > mend:
                         break
-                    if mname == b"hdlr":
-                        # hdlr: ver/flags(4) pre_defined(4) handler_type(4)
-                        ht = buf[mpos + 8 + 4 + 4:mpos + 8 + 4 + 4 + 4]
-                        hdlr_type = ht
+                    if mname == b"minf":
+                        ipos = mpos + 8
+                        iend = mpos + msize
+                        while ipos + 8 <= iend:
+                            isize = struct.unpack(">I", mb[ipos:ipos + 4])[0]
+                            iname = mb[ipos + 4:ipos + 8]
+                            if isize < 8 or ipos + isize > iend:
+                                break
+                            if iname == b"stbl":
+                                sp = ipos + 8
+                                send = ipos + isize
+                                while sp + 8 <= send:
+                                    ssize = struct.unpack(">I", mb[sp:sp + 4])[0]
+                                    sname = mb[sp + 4:sp + 8]
+                                    if ssize < 8 or sp + ssize > send:
+                                        break
+                                    if sname == b"stts":
+                                        stts = (sp + 8, ssize - 8)
+                                    elif sname == b"stsz":
+                                        stsz = (sp + 8, ssize - 8)
+                                    elif sname in (b"stco", b"co64"):
+                                        chunk_box = (sp + 8, ssize - 8, sname == b"co64")
+                                    sp += ssize
+                            ipos += isize
                     mpos += msize
             cpos += csize
-        if hdlr_type == b"meta":
-            meta_trak = (tpos, tsize)
-            break
 
-    if meta_trak is None:
-        print("    FAIL: no metadata (hdlr 'meta') track found")
-        return False
+        if not (stts and stsz and chunk_box):
+            print("    FAIL: could not find stts/stsz/chunk-offset box in metadata track")
+            return False
 
-    tpos, tsize = meta_trak
-    # Now extract stts, stsz, and the chunk-offset box (stco or co64) from this trak.
-    stts = None
-    stsz = None
-    chunk_box = None   # (offset, len, is_co64)
-    cpos = tpos + 8
-    cend = tpos + tsize
-    while cpos + 8 <= cend:
-        csize = struct.unpack(">I", buf[cpos:cpos + 4])[0]
-        cname = buf[cpos + 4:cpos + 8]
-        if csize < 8 or cpos + csize > cend:
-            break
-        if cname == b"mdia":
-            mpos = cpos + 8
-            mend = cpos + csize
-            while mpos + 8 <= mend:
-                msize = struct.unpack(">I", buf[mpos:mpos + 4])[0]
-                mname = buf[mpos + 4:mpos + 8]
-                if msize < 8 or mpos + msize > mend:
-                    break
-                if mname == b"minf":
-                    ipos = mpos + 8
-                    iend = mpos + msize
-                    while ipos + 8 <= iend:
-                        isize = struct.unpack(">I", buf[ipos:ipos + 4])[0]
-                        iname = buf[ipos + 4:ipos + 8]
-                        if isize < 8 or ipos + isize > iend:
-                            break
-                        if iname == b"stbl":
-                            sp = ipos + 8
-                            send = ipos + isize
-                            while sp + 8 <= send:
-                                ssize = struct.unpack(">I", buf[sp:sp + 4])[0]
-                                sname = buf[sp + 4:sp + 8]
-                                if ssize < 8 or sp + ssize > send:
-                                    break
-                                if sname == b"stts":
-                                    stts = (sp + 8, ssize - 8)
-                                elif sname == b"stsz":
-                                    stsz = (sp + 8, ssize - 8)
-                                elif sname in (b"stco", b"co64"):
-                                    chunk_box = (sp + 8, ssize - 8, sname == b"co64")
-                                sp += ssize
-                        ipos += isize
-                mpos += msize
-        cpos += csize
+        # Parse stsz: ver/flags(4) sample_size(4) sample_count(4)
+        sz_off, _sz_len = stsz
+        sample_size = struct.unpack(">I", mb[sz_off + 4:sz_off + 8])[0]
+        sample_count = struct.unpack(">I", mb[sz_off + 8:sz_off + 12])[0]
 
-    if not (stts and stsz and chunk_box):
-        print("    FAIL: could not find stts/stsz/chunk-offset box in metadata track")
-        return False
+        # Parse the chunk-offset box (stco: u32 offset, co64: u64 offset).
+        co_off, _co_len, is_co64 = chunk_box
+        chunk_count = struct.unpack(">I", mb[co_off + 4:co_off + 8])[0]
+        if chunk_count != 1:
+            print("    FAIL: expected 1 chunk, got %d" % chunk_count)
+            return False
+        if is_co64:
+            data_offset = struct.unpack(">Q", mb[co_off + 8:co_off + 16])[0]
+        else:
+            data_offset = struct.unpack(">I", mb[co_off + 8:co_off + 12])[0]
 
-    # Parse stsz: ver/flags(4) sample_size(4) sample_count(4)
-    sz_off, sz_len = stsz
-    sample_size = struct.unpack(">I", buf[sz_off + 4:sz_off + 8])[0]
-    sample_count = struct.unpack(">I", buf[sz_off + 8:sz_off + 12])[0]
+        # Parse stts to get per-sample timestamps (ms).
+        ts_off, _ts_len = stts
+        entry_count = struct.unpack(">I", mb[ts_off + 4:ts_off + 8])[0]
+        epos = ts_off + 8
+        acc = 0
+        for _ in range(entry_count):
+            count = struct.unpack(">I", mb[epos:epos + 4])[0]
+            delta = struct.unpack(">I", mb[epos + 4:epos + 8])[0]
+            for _ in range(count):
+                acc += delta
+                abs_t.append(acc)
+            epos += 8
 
-    # Parse the chunk-offset box (stco: u32 offset, co64: u64 offset).
-    co_off, co_len, is_co64 = chunk_box
-    chunk_count = struct.unpack(">I", buf[co_off + 4:co_off + 8])[0]
-    if chunk_count != 1:
-        print("    FAIL: expected 1 chunk, got %d" % chunk_count)
-        return False
-    if is_co64:
-        data_offset = struct.unpack(">Q", buf[co_off + 8:co_off + 16])[0]
-    else:
-        data_offset = struct.unpack(">I", buf[co_off + 8:co_off + 12])[0]
+        # Read just the IMU sample region from mdat.
+        region_start = data_offset
+        region_end = data_offset + sample_count * sample_size
+        if region_start < mdat_poff or region_end > mdat_start + mdat_size:
+            print("    FAIL: sample data region outside mdat bounds")
+            return False
+        f.seek(region_start)
+        sbuf = f.read(sample_count * sample_size)
 
-    # Parse stts to get per-sample timestamps.
-    ts_off, ts_len = stts
-    entry_count = struct.unpack(">I", buf[ts_off + 4:ts_off + 8])[0]
-    timestamps = []
-    epos = ts_off + 8
-    for _ in range(entry_count):
-        count = struct.unpack(">I", buf[epos:epos + 4])[0]
-        delta = struct.unpack(">I", buf[epos + 4:epos + 8])[0]
-        for _ in range(count):
-            timestamps.append(delta)
-        epos += 8
-    # Convert deltas to absolute times (ms).
-    abs_t = []
-    acc = 0
-    for d in timestamps:
-        acc += d
-        abs_t.append(acc)
-
-    # Now read the sample data from data_offset.
-    mdat = find_box(buf, "mdat")
-    if mdat is None:
-        print("    FAIL: no mdat in output")
-        return False
-    mdat_start, mdat_size, mdat_poff = mdat
-    # data_offset is absolute in the file; mdat payload starts at mdat_poff.
-    # The sample data region is [data_offset, data_offset + sample_count*sample_size).
-    region_start = data_offset
-    region_end = data_offset + sample_count * sample_size
-    if region_start < mdat_poff or region_end > mdat_start + mdat_size:
-        print("    FAIL: sample data region outside mdat bounds")
+    if len(sbuf) < sample_count * sample_size:
+        print("    FAIL: could not read all IMU sample data")
         return False
 
     # Decode boxes.
     decoded_gyro = []
     decoded_accl = []
-    p = region_start
-    for i in range(sample_count):
-        b = buf[p:p + sample_size]
+    p = 0
+    for _i in range(sample_count):
+        b = sbuf[p:p + sample_size]
         if len(b) < sample_size:
             break
-        bsize = struct.unpack(">I", b[0:4])[0]
         bname = b[4:8]
         x, y, z = struct.unpack("<3f", b[8:20])
         if bname == b"mogy":
@@ -1176,9 +1286,12 @@ def main(argv=None):
                 print("error: WAV file not found: %s" % wf, file=sys.stderr)
                 return 2
 
-        braw_buf = Path(args.braw).read_bytes()
-        braw_tc_s, braw_fps = read_braw_timecode(braw_buf)
-        braw_dur_s = read_braw_duration(braw_buf)
+        moov_payload = _read_moov_payload_streaming(args.braw)
+        if moov_payload is None:
+            print("error: could not read BRAW moov box", file=sys.stderr)
+            return 2
+        braw_tc_s, braw_fps = read_timecode_from_moov_payload(moov_payload)
+        braw_dur_s = read_duration_from_moov_payload(moov_payload)
         if braw_dur_s is None:
             print("error: could not read BRAW duration", file=sys.stderr)
             return 2

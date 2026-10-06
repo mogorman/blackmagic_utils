@@ -38,9 +38,10 @@ BRAW reader is actually consuming the embedded track.
 
 | File | Purpose |
 |---|---|
-| [`bm_utils`](bm_utils) | The single entry point: `bm_utils inject_gyro \| extract_gyro \| install`. Run it straight from the repo, or via the nix package. |
+| [`bm_utils`](bm_utils) | The single entry point: `bm_utils inject_gyro \| inject_audio \| extract_gyro \| install`. Run it straight from the repo, or via the nix package. |
 | [`completions/bm_utils`](completions/bm_utils) | Bash tab-completion for `bm_utils` (subcommands + file names). |
 | [`inject_gyro_into_braw.py`](inject_gyro_into_braw.py) | `.gcsv` → `.braw`: embed a Gyroflow IMU log into a BRAW file as a native MP4 metadata track. |
+| [`inject_audio_into_braw.py`](inject_audio_into_braw.py) | `.wav` → `.braw`: inject 1-16 PCM audio tracks into a BRAW file as native MP4 sound tracks (for DaVinci Resolve). |
 | [`extract_gyro_from_braw.py`](extract_gyro_from_braw.py) | `.braw` → `.gcsv`: read the IMU embedded in a BRAW file and write a standard Gyroflow `.gcsv`. |
 | [`scripts/`](scripts/) | Fusion post-render hooks installed by `bm_utils install` into `~/.local/share/DaVinciResolve/Fusion/Scripts`. |
 
@@ -97,6 +98,49 @@ Options:
 
 The injector validates the result by re-parsing the written file and confirming
 every sample round-trips, and it refuses to clobber the input file.
+
+The `inject_gyro` command also accepts `--audio` to inject WAV tracks in the
+same pass (see `inject_audio` below for the full option set).
+
+### Inject audio tracks into a BRAW
+
+```bash
+bm_utils inject_audio INPUT.braw TRACK1.wav [TRACK2.wav ...] [options]
+```
+
+Injects 1-16 raw PCM WAV files as native MP4 sound tracks readable by
+DaVinci Resolve. Audio is stored as uncompressed PCM — no transcoding, no loss.
+
+**Timecode slicing:** the WAV is often one long field recording spanning
+multiple BRAW clips. The tool reads the BRAW's embedded timecode track to
+determine the clip's start TC and duration, then extracts only the matching
+slice from the WAV (padding with silence if the WAV doesn't cover the full
+range).
+
+Options:
+
+| Option | Meaning |
+|---|---|
+| `-o, --output PATH` | Output BRAW path (default: `<input>_injected.braw`). |
+| `--wav-start-tc HH:MM:SS:FF` | WAV start timecode (default: auto from BWF `time` chunk). |
+| `--braw-start-tc HH:MM:SS:FF` | Override BRAW start timecode (default: auto from BRAW timecode track). |
+| `--fps N` | Frame rate for timecode interpretation (default: auto from BRAW). |
+| `--offset SECONDS` | Direct offset in seconds (bypasses timecode math). |
+| `--no-verify` | Skip the built-in re-parse verification. |
+
+Supported WAV formats: 32-bit float (primary, Resolve's native format), 32-bit
+integer, 24-bit, and 16-bit PCM. BWF files with a `time` chunk are
+auto-detected for their start timecode.
+
+Example:
+
+```bash
+# One long recording, three BRAW clips from the same event:
+bm_utils inject_audio clip_a.braw recording.wav --wav-start-tc 10:00:00:00
+bm_utils inject_audio clip_b.braw recording.wav --wav-start-tc 10:00:00:00
+bm_utils inject_audio clip_c.braw recording.wav --wav-start-tc 10:00:00:00
+# Each clip gets only its own timecode slice of the recording.
+```
 
 ### Extract a GCSV from a BRAW
 
@@ -167,10 +211,13 @@ error ~1e-7). Timestamps round-trip exactly.
 
 ## Notes & caveats
 
-- **Only the IMU track is touched.** The injector performs MP4 "box surgery": it
-  rewrites the `moov` atom (adding the new track and updating `mvhd`) and
-  appends the new sample data, leaving the original video/audio/timecode tracks
-  byte-for-byte intact. The output is a valid BRAW that plays normally.
+- **Only new tracks are added.** The injectors perform MP4 "box surgery": they
+  rewrite the `moov` atom (adding new tracks) and append the new sample data,
+  leaving the original video/audio/timecode tracks byte-for-byte intact. The
+  output is a valid BRAW that plays normally.
+- **Audio tracks:** injected WAV audio is stored as uncompressed PCM in native
+  MP4 `soun` tracks. DaVinci Resolve reads these as additional audio tracks in
+  the media pool. Up to 16 tracks per file.
 - **Large files (> 4 GB):** the injector uses the `co64`/`largesize` MP4
   mechanisms so chunk offsets and box sizes stay correct for big clips.
 - **Orientation:** if your logger's GCSV uses a different axis convention than

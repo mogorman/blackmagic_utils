@@ -3,6 +3,7 @@
 # bm_utils -- single entry point for the Blackmagic RAW gyro / IMU tools.
 #
 #   bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
+#   bm_utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
 #   bm_utils extract_gyro  INPUT.braw [options]               # .braw -> .gcsv
 #   bm_utils install                                               # install Fusion post-render scripts
 #
@@ -79,9 +80,10 @@ usage() {
 bm_utils -- Blackmagic RAW gyro / IMU tools
 
 Usage:
-  bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
-  bm_utils extract_gyro  INPUT.braw [options]              # .braw -> .gcsv
-  bm_utils install                                                  # install Fusion post-render scripts
+  bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]       # .gcsv -> .braw
+  bm_utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
+  bm_utils extract_gyro  INPUT.braw [options]                  # .braw -> .gcsv
+  bm_utils install                                                    # install Fusion post-render scripts
   bm_utils -h | --help
 
 Run 'bm_utils <subcommand> --help' for a subcommand's options.
@@ -94,6 +96,9 @@ case "${1:-}" in
         ;;
     inject_gyro)
         exec "$py" "$lib/inject_gyro_into_braw.py" "${@:2}"
+        ;;
+    inject_audio)
+        exec "$py" "$lib/inject_audio_into_braw.py" "${@:2}"
         ;;
     extract_gyro)
         exec "$py" "$lib/extract_gyro_from_braw.py" "${@:2}"

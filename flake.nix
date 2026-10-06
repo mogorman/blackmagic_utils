@@ -24,7 +24,7 @@
             mkdir -p $out/bin $out/lib/bm_utils $out/share/bm_utils/scripts $out/share/bash-completion/completions
 
             # Python logic (invoked explicitly, so no shebang fixup needed).
-            cp $src/inject_gyro_into_braw.py $src/extract_gyro_from_braw.py $out/lib/bm_utils/
+            cp $src/inject_gyro_into_braw.py $src/inject_audio_into_braw.py $src/extract_gyro_from_braw.py $out/lib/bm_utils/
 
             # Fusion post-render scripts, so `bm_utils install` is self-contained.
             cp -R $src/scripts/. $out/share/bm_utils/scripts/

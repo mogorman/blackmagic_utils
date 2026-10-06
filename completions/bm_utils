@@ -9,7 +9,7 @@ _bm_utils() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local subcommands="install inject_gyro extract_gyro"
+    local subcommands="install inject_gyro inject_audio extract_gyro"
 
     # First argument slot: offer the subcommands (and help).
     if [ "${COMP_CWORD}" -eq 1 ]; then
