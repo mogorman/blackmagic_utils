@@ -182,35 +182,6 @@ def wav_mp4_4cc(wav):
 # BRAW timecode / duration reader
 # ---------------------------------------------------------------------------
 
-def _read_top_level_boxes(buf):
-    """Yield (name, start, size, payload_offset) for each top-level box."""
-    pos = 0
-    n = len(buf)
-    while pos + 8 <= n:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        header = 8
-        if size == 1:
-            if pos + 16 > n:
-                break
-            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
-            header = 16
-        elif size == 0:
-            size = n - pos
-        if size < header or pos + size > n:
-            break
-        yield name, pos, size, pos + header
-        pos += size
-
-
-def _find_box(buf, name):
-    """Return (start, size, payload_offset) of first top-level box with name."""
-    for n, start, size, poff in _read_top_level_boxes(buf):
-        if n == name.encode("ascii"):
-            return start, size, poff
-    return None
-
-
 def _iter_top_level_boxes_stream(f, fsize):
     """Yield (name, start, size, poff) for top-level boxes by streaming header
     reads from an open binary file. O(1) memory -- the file is never loaded."""
@@ -333,18 +304,6 @@ def _find_mdhd_duration(buf, trak_pos, trak_size):
     return timescale, duration
 
 
-def read_braw_timecode(buf):
-    """
-    Read start TC (seconds from midnight) and fps from the BRAW's timecode track.
-    Returns (start_tc_s, fps) or (None, None) if not found.
-    """
-    moov = _find_box(buf, "moov")
-    if moov is None:
-        return None, None
-    moov_start, moov_size, moov_poff = moov
-    return read_timecode_from_moov_payload(buf[moov_poff:moov_start + moov_size])
-
-
 def read_timecode_from_moov_payload(moov_payload):
     """Read (start_tc_s, fps) from a moov box *payload* (0-based offsets)."""
     for name, pos, size, _poff in _walk_boxes(moov_payload, 0, len(moov_payload)):
@@ -399,15 +358,6 @@ def _read_tmcd(buf, trak_pos, trak_size):
         return None
     start_tc_s = start_time / fps
     return start_tc_s, fps
-
-
-def read_braw_duration(buf):
-    """Read movie duration in seconds from moov > mvhd. Returns float seconds."""
-    moov = _find_box(buf, "moov")
-    if moov is None:
-        return None
-    moov_start, moov_size, moov_poff = moov
-    return read_duration_from_moov_payload(buf[moov_poff:moov_start + moov_size])
 
 
 def read_duration_from_moov_payload(moov_payload):
@@ -643,39 +593,6 @@ def build_audio_track(track_id, sample_rate, duration, stbl_boxes):
 # ---------------------------------------------------------------------------
 # Track ID picker
 # ---------------------------------------------------------------------------
-
-def _pick_track_ids(buf, moov_poff, moov_size, count):
-    """Pick `count` unique track IDs that don't collide with existing tracks."""
-    used = set()
-    pos = moov_poff
-    end = moov_poff + (moov_size - 8)
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        if size < 8 or pos + size > end:
-            break
-        if name == b"trak":
-            tkhd_start = pos + 8
-            if tkhd_start + 28 <= end and buf[tkhd_start + 4:tkhd_start + 8] == b"tkhd":
-                ver_flags = struct.unpack(">I", buf[tkhd_start + 8:tkhd_start + 12])[0]
-                version = ver_flags >> 24
-                if version == 0:
-                    off = tkhd_start + 8 + 4 + 4 + 4
-                else:
-                    off = tkhd_start + 8 + 4 + 8 + 8
-                tid = struct.unpack(">I", buf[off:off + 4])[0]
-                used.add(tid)
-        pos += size
-
-    ids = []
-    candidate = 1
-    while len(ids) < count:
-        if candidate not in used:
-            ids.append(candidate)
-            used.add(candidate)
-        candidate += 1
-    return ids
-
 
 def _pick_track_ids_from_moov_payload(payload, count):
     """Pick `count` unique track IDs that don't collide with tracks in a moov

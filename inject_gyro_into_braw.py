@@ -303,47 +303,6 @@ def box64(name, payload):
     return struct.pack(">I4sQ", 1, name, largesize) + payload
 
 
-def read_top_level_boxes(buf):
-    """
-    Yield (name, start, size, payload_offset) for each top-level box.
-    start is the absolute offset of the size field; payload starts at start+8
-    (or start+16 for a 64-bit 'largesize' box).
-    """
-    pos = 0
-    n = len(buf)
-    while pos + 8 <= n:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        header = 8
-        if size == 1:
-            if pos + 16 > n:
-                break
-            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
-            header = 16
-        elif size == 0:
-            # box extends to end of file
-            size = n - pos
-        if size < header or pos + size > n:
-            break
-        yield name, pos, size, pos + header
-        pos += size
-
-
-def find_box(buf, name):
-    """Return (start, size, payload_offset) of the first top-level box with name, or None."""
-    for n, start, size, poff in read_top_level_boxes(buf):
-        if n == name.encode("ascii"):
-            return start, size, poff
-    return None
-
-
-def patch_box_size(buf, start, new_size):
-    """Overwrite the u32 size field at `start` with new_size (must fit in u32)."""
-    if new_size > 0xFFFFFFFF:
-        raise ValueError("Box size %d exceeds u32; 64-bit box required" % new_size)
-    struct.pack_into(">I", buf, start, new_size)
-
-
 def iter_top_level_boxes_stream(f, fsize):
     """
     Yield (name, start, size, poff) for each top-level box by streaming header
@@ -808,74 +767,6 @@ def inject(braw_path, gcsv, args, audio_tracks=None):
 def _default_output(braw_path):
     p = Path(braw_path)
     return p.with_name(p.stem + "_injected" + p.suffix)
-
-
-def _pick_track_id(buf, moov_poff, moov_size):
-    """Pick a track id that does not collide with existing tracks in moov."""
-    # Walk the moov payload for 'trak' boxes and collect their track ids.
-    used = set()
-    pos = moov_poff
-    end = moov_poff + (moov_size - 8)
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        if size < 8 or pos + size > end:
-            break
-        if name == b"trak":
-            # tkhd is the first child of trak; track_id is at offset
-            # 8 (trak header) + 4 (tkhd size) + 4 (tkhd name) + 4 (ver/flags)
-            # + 4 (creation) + 4 (modification) = +24 from trak start.
-            tkhd_start = pos + 8
-            # find tkhd
-            if buf[tkhd_start + 4:tkhd_start + 8] == b"tkhd":
-                ver_flags = struct.unpack(">I", buf[tkhd_start + 8:tkhd_start + 12])[0]
-                version = ver_flags >> 24
-                # For version 0: after ver/flags(4) creation(4) modification(4)
-                # track_id(4)
-                off = tkhd_start + 8 + 4 + 4 + 4
-                if version == 1:
-                    off = tkhd_start + 8 + 4 + 8 + 8  # ver/flags, creation(8), mod(8)
-                tid = struct.unpack(">I", buf[off:off + 4])[0]
-                used.add(tid)
-        pos += size
-
-    candidate = 1
-    while candidate in used:
-        candidate += 1
-    return candidate
-
-
-def _pick_track_ids(buf, moov_poff, moov_size, count):
-    """Pick `count` unique track IDs that don't collide with existing tracks."""
-    used = set()
-    pos = moov_poff
-    end = moov_poff + (moov_size - 8)
-    while pos + 8 <= end:
-        size = struct.unpack(">I", buf[pos:pos + 4])[0]
-        name = buf[pos + 4:pos + 8]
-        if size < 8 or pos + size > end:
-            break
-        if name == b"trak":
-            tkhd_start = pos + 8
-            if tkhd_start + 28 <= end and buf[tkhd_start + 4:tkhd_start + 8] == b"tkhd":
-                ver_flags = struct.unpack(">I", buf[tkhd_start + 8:tkhd_start + 12])[0]
-                version = ver_flags >> 24
-                if version == 0:
-                    off = tkhd_start + 8 + 4 + 4 + 4
-                else:
-                    off = tkhd_start + 8 + 4 + 8 + 8
-                tid = struct.unpack(">I", buf[off:off + 4])[0]
-                used.add(tid)
-        pos += size
-
-    ids = []
-    candidate = 1
-    while len(ids) < count:
-        if candidate not in used:
-            ids.append(candidate)
-            used.add(candidate)
-        candidate += 1
-    return ids
 
 
 def _pick_track_ids_from_moov_payload(payload, count):
