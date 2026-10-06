@@ -1,8 +1,8 @@
-# Bash completion for `bm_utils`.
+# Bash completion for `bm-utils`.
 #
 # Picked up automatically when bash-completion is loaded (this file is
-# installed to share/bash-completion/completions/bm_utils by the flake).
-# Can also be sourced directly, e.g.:  . ./completions/bm_utils
+# installed to share/bash-completion/completions/bm-utils by the flake).
+# Can also be sourced directly, e.g.:  . ./completions/bm-utils
 
 _bm_utils() {
     local cur prev
@@ -22,4 +22,4 @@ _bm_utils() {
     return 0
 }
 
-complete -F _bm_utils bm_utils
+complete -F _bm_utils bm-utils

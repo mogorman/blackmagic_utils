@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# bm_utils -- single entry point for the Blackmagic RAW gyro / IMU tools.
+# bm-utils -- single entry point for the Blackmagic RAW gyro / IMU tools.
 #
-#   bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
-#   bm_utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
-#   bm_utils extract_gyro  INPUT.braw [options]               # .braw -> .gcsv
-#   bm_utils install                                               # install Fusion post-render scripts
+#   bm-utils inject_gyro   INPUT.braw INPUT.gcsv [options]   # .gcsv -> .braw
+#   bm-utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
+#   bm-utils extract_gyro  INPUT.braw [options]               # .braw -> .gcsv
+#   bm-utils install                                               # install Fusion post-render scripts
 #
-# Each subcommand's full option list:  bm_utils <subcommand> --help
+# Each subcommand's full option list:  bm-utils <subcommand> --help
 #
 # The interpreter is taken from $BM_UTILS_PYTHON when set (the nix wrapper
 # sets it to its bundled python) and otherwise falls back to `python3` on the
@@ -19,14 +19,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Locate our resources. The layout differs between a nix install and the
 # working tree, so probe for which one we're in.
-#   nix :  <root>/bin/bm_utils, <root>/lib/bm_utils, <root>/share/bm_utils/scripts
-#   repo :  bm_utils next to the python scripts and scripts/
+#   nix :  <root>/bin/bm-utils, <root>/lib/bm-utils, <root>/share/bm-utils/scripts
+#   repo :  bm-utils next to the python scripts and scripts/
 # ---------------------------------------------------------------------------
 base="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -d "$base/../lib/bm_utils" ]; then
+if [ -d "$base/../lib/bm-utils" ]; then
     root="$(cd "$base/.." && pwd)"
-    lib="$root/lib/bm_utils"
-    scripts_src="$root/share/bm_utils/scripts"
+    lib="$root/lib/bm-utils"
+    scripts_src="$root/share/bm-utils/scripts"
 else
     root="$base"
     lib="$base"
@@ -77,16 +77,16 @@ install_fusion_scripts() {
 
 usage() {
     cat <<'EOF'
-bm_utils -- Blackmagic RAW gyro / IMU tools
+bm-utils -- Blackmagic RAW gyro / IMU tools
 
 Usage:
-  bm_utils inject_gyro   INPUT.braw INPUT.gcsv [options]       # .gcsv -> .braw
-  bm_utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
-  bm_utils extract_gyro  INPUT.braw [options]                  # .braw -> .gcsv
-  bm_utils install                                                    # install Fusion post-render scripts
-  bm_utils -h | --help
+  bm-utils inject_gyro   INPUT.braw INPUT.gcsv [options]       # .gcsv -> .braw
+  bm-utils inject_audio  INPUT.braw TRACK.wav [...] [options]  # .wav -> .braw
+  bm-utils extract_gyro  INPUT.braw [options]                  # .braw -> .gcsv
+  bm-utils install                                                    # install Fusion post-render scripts
+  bm-utils -h | --help
 
-Run 'bm_utils <subcommand> --help' for a subcommand's options.
+Run 'bm-utils <subcommand> --help' for a subcommand's options.
 EOF
 }
 

@@ -38,12 +38,12 @@ BRAW reader is actually consuming the embedded track.
 
 | File | Purpose |
 |---|---|
-| [`bm_utils`](bm_utils) | The single entry point: `bm_utils inject_gyro \| inject_audio \| extract_gyro \| install`. Run it straight from the repo, or via the nix package. |
-| [`completions/bm_utils`](completions/bm_utils) | Bash tab-completion for `bm_utils` (subcommands + file names). |
+| [`bm-utils`](bm-utils) | The single entry point: `bm-utils inject_gyro \| inject_audio \| extract_gyro \| install`. Run it straight from the repo, or via the nix package. |
+| [`completions/bm-utils`](completions/bm-utils) | Bash tab-completion for `bm-utils` (subcommands + file names). |
 | [`inject_gyro_into_braw.py`](inject_gyro_into_braw.py) | `.gcsv` → `.braw`: embed a Gyroflow IMU log into a BRAW file as a native MP4 metadata track. |
 | [`inject_audio_into_braw.py`](inject_audio_into_braw.py) | `.wav` → `.braw`: inject 1-16 PCM audio tracks into a BRAW file as native MP4 sound tracks (for DaVinci Resolve). |
 | [`extract_gyro_from_braw.py`](extract_gyro_from_braw.py) | `.braw` → `.gcsv`: read the IMU embedded in a BRAW file and write a standard Gyroflow `.gcsv`. |
-| [`scripts/`](scripts/) | Fusion post-render hooks installed by `bm_utils install` into `~/.local/share/DaVinciResolve/Fusion/Scripts`. |
+| [`scripts/`](scripts/) | Fusion post-render hooks installed by `bm-utils install` into `~/.local/share/DaVinciResolve/Fusion/Scripts`. |
 
 ## How it works (the short version)
 
@@ -75,14 +75,14 @@ preserved.
 
 ## Usage
 
-Everything is driven through the single `bm_utils` command (add `--help` to any
+Everything is driven through the single `bm-utils` command (add `--help` to any
 subcommand for its options). The two Python files above are the subcommands'
 engines; you don't call them directly.
 
 ### Inject a GCSV into a BRAW
 
 ```bash
-bm_utils inject_gyro INPUT.braw INPUT.gcsv [options]
+bm-utils inject_gyro INPUT.braw INPUT.gcsv [options]
 ```
 
 By default this writes `INPUT_injected.braw` (the original is left untouched).
@@ -105,7 +105,7 @@ same pass (see `inject_audio` below for the full option set).
 ### Inject audio tracks into a BRAW
 
 ```bash
-bm_utils inject_audio INPUT.braw TRACK1.wav [TRACK2.wav ...] [options]
+bm-utils inject_audio INPUT.braw TRACK1.wav [TRACK2.wav ...] [options]
 ```
 
 Injects 1-16 raw PCM WAV files as native MP4 sound tracks readable by
@@ -136,16 +136,16 @@ Example:
 
 ```bash
 # One long recording, three BRAW clips from the same event:
-bm_utils inject_audio clip_a.braw recording.wav --wav-start-tc 10:00:00:00
-bm_utils inject_audio clip_b.braw recording.wav --wav-start-tc 10:00:00:00
-bm_utils inject_audio clip_c.braw recording.wav --wav-start-tc 10:00:00:00
+bm-utils inject_audio clip_a.braw recording.wav --wav-start-tc 10:00:00:00
+bm-utils inject_audio clip_b.braw recording.wav --wav-start-tc 10:00:00:00
+bm-utils inject_audio clip_c.braw recording.wav --wav-start-tc 10:00:00:00
 # Each clip gets only its own timecode slice of the recording.
 ```
 
 ### Extract a GCSV from a BRAW
 
 ```bash
-bm_utils extract_gyro INPUT.braw [options]
+bm-utils extract_gyro INPUT.braw [options]
 ```
 
 By default this writes `INPUT.gcsv`.
@@ -167,35 +167,35 @@ back through the injector.
 
 ## Installing & running
 
-**Straight from the repo** (no nix needed) — `bm_utils` is a self-locating
+**Straight from the repo** (no nix needed) — `bm-utils` is a self-locating
 bash script, so it works when run in place. It needs `python3` on the `PATH`:
 
 ```bash
-./bm_utils inject_gyro in.braw in.gcsv
+./bm-utils inject_gyro in.braw in.gcsv
 ```
 
-**As a nix package** — this is a flake. Build it and `bm_utils` lands on your
+**As a nix package** — this is a flake. Build it and `bm-utils` lands on your
 `PATH` (along with the inject/extract engines and the `scripts/` payload):
 
 ```bash
 nix build                       # or: nix run .#blackmagic-utils
-bm_utils install               # install the Fusion post-render scripts
+bm-utils install               # install the Fusion post-render scripts
 ```
 
-`nix develop` gives a shell with `bm_utils` (and the completion) already loaded.
+`nix develop` gives a shell with `bm-utils` (and the completion) already loaded.
 
 ### Tab completion
 
-`completions/bm_utils` is a standard bash-completion file. It is installed to
-`share/bash-completion/completions/bm_utils`, so it loads automatically if you
+`completions/bm-utils` is a standard bash-completion file. It is installed to
+`share/bash-completion/completions/bm-utils`, so it loads automatically if you
 have the [`bash-completion`](https://github.com/bash-git/bash-completion)
 package enabled. To use it in a shell without that, source it:
 
 ```bash
-. /path/to/completions/bm_utils
+. /path/to/completions/bm-utils
 ```
 
-Afterwards `bm_utils <TAB>` completes the subcommands and `<TAB>` on an
+Afterwards `bm-utils <TAB>` completes the subcommands and `<TAB>` on an
 argument completes file names.
 
 ## Round-trip
